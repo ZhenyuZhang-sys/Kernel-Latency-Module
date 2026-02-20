@@ -25,11 +25,15 @@
 #ifndef _LAT_BENCH_H
 #define _LAT_BENCH_H
 
+#include <linux/atomic.h>
 #include <linux/ktime.h>
+#include <linux/list.h>
 #include <linux/percpu.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/types.h>
+
+extern atomic_t lat_bench_enabled;
 
 struct lat_bench_pcpu {
 	u64 total_ns;
@@ -40,6 +44,7 @@ struct lat_bench {
 	const char *name;
 	struct lat_bench_pcpu __percpu *pcpu;
 	struct proc_dir_entry *proc_entry;
+	struct list_head list;
 };
 
 /*
@@ -61,8 +66,14 @@ static inline ktime_t lat_bench_start(void)
 
 static inline void lat_bench_end(struct lat_bench *lb, ktime_t start)
 {
-	s64 delta = ktime_to_ns(ktime_sub(ktime_get(), start));
-	struct lat_bench_pcpu *p = this_cpu_ptr(lb->pcpu);
+	s64 delta;
+	struct lat_bench_pcpu *p;
+
+	if (!atomic_read(&lat_bench_enabled))
+		return;
+
+	delta = ktime_to_ns(ktime_sub(ktime_get(), start));
+	p = this_cpu_ptr(lb->pcpu);
 
 	p->total_ns += delta;
 	p->count++;
