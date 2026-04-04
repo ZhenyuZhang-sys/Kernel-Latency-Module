@@ -18,6 +18,9 @@ static struct proc_dir_entry *lat_bench_dir;
 atomic_t lat_bench_enabled = ATOMIC_INIT(0);
 EXPORT_SYMBOL_GPL(lat_bench_enabled);
 
+atomic_t lat_bench_hist_enabled = ATOMIC_INIT(0);
+EXPORT_SYMBOL_GPL(lat_bench_hist_enabled);
+
 static DEFINE_SPINLOCK(lat_bench_lock);
 static LIST_HEAD(lat_bench_list);
 
@@ -27,13 +30,16 @@ static int lat_bench_show(struct seq_file *m, void *v)
 	u64 total_ns = 0;
 	u64 count = 0;
 	u64 avg_ns = 0;
-	int cpu;
+	u64 hist[LAT_BENCH_HIST_BUCKETS] = {0};
+	int cpu, i;
 
 	for_each_possible_cpu(cpu) {
 		struct lat_bench_pcpu *p = per_cpu_ptr(lb->pcpu, cpu);
 
 		total_ns += p->total_ns;
 		count += p->count;
+		for (i = 0; i < LAT_BENCH_HIST_BUCKETS; i++)
+			hist[i] += p->hist[i];
 	}
 
 	if (count)
@@ -42,6 +48,14 @@ static int lat_bench_show(struct seq_file *m, void *v)
 	seq_printf(m, "count: %llu\n", count);
 	seq_printf(m, "total_ns: %llu\n", total_ns);
 	seq_printf(m, "avg_ns: %llu\n", avg_ns);
+
+	/* Histogram output */
+	seq_printf(m, "hist_shift: %d\n", LAT_BENCH_HIST_SHIFT);
+	seq_printf(m, "hist_buckets: %d\n", LAT_BENCH_HIST_BUCKETS);
+	seq_puts(m, "hist:");
+	for (i = 0; i < LAT_BENCH_HIST_BUCKETS; i++)
+		seq_printf(m, " %llu", hist[i]);
+	seq_putc(m, '\n');
 
 	return 0;
 }
@@ -55,7 +69,24 @@ static void lat_bench_clear_one(struct lat_bench *lb)
 
 		p->total_ns = 0;
 		p->count = 0;
+		memset(p->hist, 0, sizeof(p->hist));
 	}
+}
+
+static void lat_bench_clear_hist_all(void)
+{
+	struct lat_bench *lb;
+	int cpu;
+
+	spin_lock(&lat_bench_lock);
+	list_for_each_entry(lb, &lat_bench_list, list) {
+		for_each_possible_cpu(cpu) {
+			struct lat_bench_pcpu *p = per_cpu_ptr(lb->pcpu, cpu);
+
+			memset(p->hist, 0, sizeof(p->hist));
+		}
+	}
+	spin_unlock(&lat_bench_lock);
 }
 
 static void lat_bench_clear_all(void)
@@ -67,6 +98,8 @@ static void lat_bench_clear_all(void)
 		lat_bench_clear_one(lb);
 	spin_unlock(&lat_bench_lock);
 }
+
+/* ── /proc/lat_bench/enable ─────────────────────────────────────────────────── */
 
 static int lat_bench_enable_show(struct seq_file *m, void *v)
 {
@@ -94,6 +127,7 @@ static ssize_t lat_bench_enable_write(struct file *file,
 		atomic_set(&lat_bench_enabled, 0);
 		lat_bench_clear_all();
 	} else if (val == 1) {
+		lat_bench_clear_all();
 		atomic_set(&lat_bench_enabled, 1);
 	} else {
 		return -EINVAL;
@@ -114,6 +148,58 @@ static const struct proc_ops lat_bench_enable_ops = {
 	.proc_lseek	= seq_lseek,
 	.proc_release	= single_release,
 };
+
+/* ── /proc/lat_bench/hist_enable ────────────────────────────────────────────── */
+
+static int lat_bench_hist_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", atomic_read(&lat_bench_hist_enabled));
+	return 0;
+}
+
+static ssize_t lat_bench_hist_enable_write(struct file *file,
+					   const char __user *buf,
+					   size_t count, loff_t *ppos)
+{
+	char kbuf[4];
+	int val;
+
+	if (count > sizeof(kbuf) - 1)
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+	kbuf[count] = '\0';
+
+	if (kstrtoint(kbuf, 10, &val))
+		return -EINVAL;
+
+	if (val == 0) {
+		atomic_set(&lat_bench_hist_enabled, 0);
+		/* Keep histogram data for reading — don't clear */
+	} else if (val == 1) {
+		lat_bench_clear_hist_all();
+		atomic_set(&lat_bench_hist_enabled, 1);
+	} else {
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+static int lat_bench_hist_enable_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, lat_bench_hist_enable_show, NULL);
+}
+
+static const struct proc_ops lat_bench_hist_enable_ops = {
+	.proc_open	= lat_bench_hist_enable_open,
+	.proc_read	= seq_read,
+	.proc_write	= lat_bench_hist_enable_write,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+/* ── Registration ───────────────────────────────────────────────────────────── */
 
 int lat_bench_register(struct lat_bench *lb)
 {
@@ -155,6 +241,13 @@ static int __init lat_bench_init(void)
 
 	if (!proc_create("enable", 0644, lat_bench_dir,
 			 &lat_bench_enable_ops)) {
+		remove_proc_entry("lat_bench", NULL);
+		return -ENOMEM;
+	}
+
+	if (!proc_create("hist_enable", 0644, lat_bench_dir,
+			 &lat_bench_hist_enable_ops)) {
+		remove_proc_entry("enable", lat_bench_dir);
 		remove_proc_entry("lat_bench", NULL);
 		return -ENOMEM;
 	}
